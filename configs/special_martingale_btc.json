@@ -1,5 +1,5 @@
 {
-  "strategy_name": "ALGO 3 - Special Martingale (Trend-First Reversion Engine)",
+  "strategy_name": "ALGO Trend Transition (Pattern C: FADE-FOLLOW-FADE)",
   "mode": "real",
   "asset": "BTC",
   "consecutive_streak_count": 2,
@@ -21,7 +21,7 @@
   "beat_duration_min": 15,
   "stop_maker_sec": 240,
   "min_maker_sec": 0,
-  "max_maker_price": 0.52,
+  "max_maker_price": 0.48,
   "marketable_limit": true,
   "taker_limit_price": null,
   "active_order_adjusted": false,
@@ -35,8 +35,8 @@
     "lookback_candles": 16
   },
   "delta_filter": {
-    "enabled": false,
-    "delta_max_range": 220.0,
+    "enabled": true,
+    "delta_max_range": null,
     "delta_threshold": 75.0,
     "source": "binance"
   },
