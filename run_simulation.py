@@ -71,6 +71,10 @@ def simulate_martingale(
 ) -> dict:
     """
     Simulates Martingale strategy using strict forward execution across chronological beats.
+    Realistic market mechanics:
+      - At candle open (t=0), Kalshi 15m binary markets open at ~50/50 ($0.48 bid / $0.51 ask).
+      - Realistic fill prices range from $0.45 (low resting maker bid) to $0.52 (marketable taker crossing ask).
+      - Prices <= $0.40 are unfillable at market open and require huge adverse moves.
     """
     N = len(outcomes)
     cap = len(pattern)
@@ -191,6 +195,14 @@ def print_single_summary(r: dict):
     print(f"  Limit Entry Price      : ${r['entry_price']:.2f}")
     print(f"  Total Analyzed Beats   : {r['total_beats']:,}")
     print("-" * 85)
+
+    if r['entry_price'] < 0.45:
+        print("  [!] REALITY WARNING    : In Kalshi 15m BTC contracts, markets open at ~50/50 ($0.50).")
+        print(f"                           A limit bid at ${r['entry_price']:.2f} is {int((0.50-r['entry_price'])*100)}¢ below market open.")
+        print("                           In real trading, this order CANNOT fill at candle open.")
+        print("                           The resulting PnL is a theoretical artifact assuming 100% fills at an impossible price.")
+        print("-" * 85)
+
     print(f"  Completed Campaigns    : {r['campaigns']} (Filter Skips: {r['filter_skips']})")
     print(f"  Campaign Win Rate      : {r['camp_wr']:.2f}% ({r['camp_wins']} Won / {r['camp_losses']} Lost)")
     
@@ -221,9 +233,9 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Special Martingale Simulation")
     parser.add_argument("--config", type=str, default=os.path.join(SCRIPT_DIR, "config.json"), help="Path to config JSON file")
     parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR, help="Path to BTC market dataset")
-    parser.add_argument("--compare", action="store_true", help="Run multi-price comparison suite")
+    parser.add_argument("--compare", action="store_true", help="Run multi-price comparison suite across realistic execution prices")
     parser.add_argument("--base-stake", type=float, default=None, help="Override base stake USD")
-    parser.add_argument("--entry-price", type=float, default=None, help="Override entry price (e.g. 0.48, 0.50, 0.52)")
+    parser.add_argument("--entry-price", type=float, default=None, help="Override entry price (realistic range: 0.45 - 0.52)")
     parser.add_argument("--min-body", type=float, default=None, help="Override candle body threshold")
 
     args = parser.parse_args()
@@ -235,11 +247,12 @@ def main():
     if args.compare:
         min_body = args.min_body if args.min_body is not None else 75.0
         base_stake = args.base_stake if args.base_stake is not None else 10.0
-        prices = [0.45, 0.48, 0.50, 0.52]
+        # Realistic market open prices for Kalshi 15m binary contracts:
+        prices = [0.45, 0.47, 0.48, 0.49, 0.50, 0.52]
 
         results = []
         for p in prices:
-            mode_lbl = "Taker" if p > 0.50 else ("Fair Mid" if p == 0.50 else "Maker")
+            mode_lbl = "Taker Cross Spread" if p > 0.50 else ("Fair Midpoint" if p == 0.50 else "Maker Resting Bid")
             name = f"Pattern C ({mode_lbl} ${p:.2f})"
             r = simulate_martingale(
                 outcomes=outcomes,
