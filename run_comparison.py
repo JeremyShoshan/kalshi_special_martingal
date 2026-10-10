@@ -4,14 +4,16 @@ import glob
 import csv
 import json
 import argparse
-from datetime import datetime
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_DIR = r"c:\Users\Jeremy\Documents\projects\collect_data\combined_dataset\BTC"
+DEFAULT_OB_CACHE = os.path.join(SCRIPT_DIR, "orderbook_fill_cache.json")
+
 
 def load_dataset(data_dir: str):
     """
     Loads all btc_15m_markets_*.csv files from data_dir in chronological order.
-    Returns (outcomes, bodies, open_times, tickers).
+    Returns (outcomes, bodies, open_times, slug_order, markets).
     """
     market_files = sorted(glob.glob(os.path.join(data_dir, "**", "btc_15m_markets_*.csv"), recursive=True))
     if not market_files:
@@ -52,27 +54,29 @@ def load_dataset(data_dir: str):
     outcomes = [markets[s]["outcome"] for s in slug_order]
     bodies = [abs(markets[s]["coin_end"] - markets[s]["coin_start"]) for s in slug_order]
     open_times = [markets[s]["open_time"] for s in slug_order]
-    tickers = slug_order
 
-    return outcomes, bodies, open_times, tickers
+    return outcomes, bodies, open_times, slug_order, markets
 
 
 def simulate_martingale(
     outcomes: list[str],
     bodies: list[float],
+    slug_order: list[str],
+    ob_cache: dict | None = None,
     consecutive_streak_count: int = 2,
     pattern: tuple[str, ...] = ("FADE", "FOLLOW", "FADE"),
     multipliers: tuple[float, ...] = (1.0, 2.0, 4.0),
     base_stake_usd: float = 10.0,
     min_body: float = 0.0,
     entry_price: float = 0.48,
+    stop_maker_sec: int = 240,
     strategy_name: str = "Special Martingale Pattern C",
 ) -> dict:
     """
-    Simulates a Martingale campaign strategy using strict forward out-of-sample execution.
-    At beat i:
-      Historical window is 0 .. i-1.
-      Order is placed on beat i, resolved against outcomes[i].
+    Simulates Martingale strategy using strict forward execution AND real orderbook depth:
+    - If ob_cache is provided, verifies if each order realistically filled as Taker or Maker
+      within stop_maker_sec.
+    - If unfilled, $0 is risked, no capital lost, order is cancelled.
     """
     N = len(outcomes)
     cap = len(pattern)
@@ -88,14 +92,17 @@ def simulate_martingale(
 
     camp_wins = 0
     camp_losses = 0
-    total_trades = 0
-    trade_wins = 0
+    filled_trades = 0
+    unfilled_orders = 0
+    maker_fills = 0
+    taker_fills = 0
     step_wins = [0] * cap
     filter_skips = 0
 
-    pnl_history = []
+    total_taker_fees = 0.0
 
     for i in range(consecutive_streak_count, N):
+        slug = slug_order[i]
         actual = outcomes[i]
 
         # Calculate streak on resolved tail [0 .. i-1]
@@ -122,7 +129,6 @@ def simulate_martingale(
                 trigger_dir = streak_side
 
         if in_camp:
-            total_trades += 1
             action = pattern[step]
             stake = stakes[step]
 
@@ -131,19 +137,68 @@ def simulate_martingale(
             elif action == "FADE":
                 bet_side = "Down" if trigger_dir == "Up" else "Up"
 
+            # Check Real Orderbook Fill
+            filled = True
+            fill_px = entry_price
+            is_taker = False
+
+            if ob_cache:
+                ob = ob_cache.get(slug)
+                if ob:
+                    open_ask = ob["open_up_ask"] if bet_side == "Up" else ob["open_down_ask"]
+                    min_bid = ob["min_up_bid"] if bet_side == "Up" else ob["min_down_bid"]
+
+                    # 1. Marketable Taker: ask is at or below our limit price
+                    if open_ask <= entry_price:
+                        filled = True
+                        fill_px = open_ask
+                        is_taker = True
+                    # 2. Resting Maker: ask > entry_price, but market trades down to our bid within 240s
+                    elif min_bid <= entry_price:
+                        filled = True
+                        fill_px = entry_price
+                        is_taker = False
+                    # 3. Timeout Unfilled: price never reached our limit price
+                    else:
+                        filled = False
+                else:
+                    # Missing from orderbook -> cannot confirm fill -> treat as unfilled
+                    filled = False
+
+            if not filled:
+                unfilled_orders += 1
+                # If Step 0 was unfilled and market reversed, clean reset!
+                if step == 0 and actual != trigger_dir:
+                    in_camp = False
+                    step = 0
+                    trigger_dir = None
+                # If streak continued or Step 1/2 was unfilled, preserve current step
+                continue
+
+            # Order Filled!
+            filled_trades += 1
+            if is_taker:
+                taker_fills += 1
+            else:
+                maker_fills += 1
+
+            shares = stake / fill_px
+            taker_fee = (shares * 0.07 * fill_px * (1.0 - fill_px)) if is_taker else 0.0
+            total_taker_fees += taker_fee
+
             if actual == bet_side:
                 # WON STEP
-                trade_wins += 1
                 camp_wins += 1
                 step_wins[step] += 1
-                profit = (stake / entry_price) * (1.0 - entry_price)
-                pnl += profit
+                gross_profit = shares * (1.0 - fill_px)
+                net_profit = gross_profit - taker_fee
+                pnl += net_profit
                 in_camp = False
                 step = 0
                 trigger_dir = None
             else:
                 # LOST STEP
-                pnl -= stake
+                pnl -= (stake + taker_fee)
                 step += 1
                 if step >= cap:
                     camp_losses += 1
@@ -156,11 +211,10 @@ def simulate_martingale(
             if (peak - pnl) > max_dd:
                 max_dd = peak - pnl
 
-            pnl_history.append(pnl)
-
     tot_camps = camp_wins + camp_losses
     c_wr = (camp_wins / tot_camps * 100.0) if tot_camps > 0 else 0.0
-    t_wr = (trade_wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    tot_orders = filled_trades + unfilled_orders
+    fill_rate = (filled_trades / tot_orders * 100.0) if tot_orders > 0 else 0.0
     ret_dd = (pnl / max_dd) if max_dd > 0 else 0.0
 
     return {
@@ -176,28 +230,36 @@ def simulate_martingale(
         "camp_wins": camp_wins,
         "camp_losses": camp_losses,
         "camp_wr": c_wr,
-        "total_trades": total_trades,
-        "trade_wins": trade_wins,
-        "trade_wr": t_wr,
+        "filled_trades": filled_trades,
+        "unfilled_orders": unfilled_orders,
+        "fill_rate": fill_rate,
+        "maker_fills": maker_fills,
+        "taker_fills": taker_fills,
+        "taker_fees": total_taker_fees,
         "step_wins": step_wins,
         "filter_skips": filter_skips,
         "net_pnl": pnl,
         "max_drawdown": max_dd,
         "ret_dd_ratio": ret_dd,
+        "used_orderbook": bool(ob_cache),
     }
 
 
 def print_single_summary(r: dict):
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 85)
     print(f"  SIMULATION RESULTS: {r['strategy_name']}")
-    print("=" * 80)
+    print("=" * 85)
+    print(f"  Data Mode              : {'REAL ORDERBOOK TICK REPLAY' if r['used_orderbook'] else 'FLAT FILL ASSUMPTION'}")
     print(f"  Trigger Streak         : {r['consecutive_streak_count']} consecutive candles")
     print(f"  Action Pattern         : {r['pattern']} (Steps 1-{len(r['step_wins'])})")
     print(f"  Stake Multipliers      : {r['multipliers']} (Base: ${r['base_stake_usd']:.2f})")
     print(f"  Candle Body Filter     : Body >= ${r['min_body']:.2f}" if r['min_body'] > 0 else "  Candle Body Filter     : None")
     print(f"  Limit Entry Price      : ${r['entry_price']:.2f}")
     print(f"  Total Analyzed Beats   : {r['total_beats']:,}")
-    print("-" * 80)
+    print("-" * 85)
+    print(f"  Orderbook Fill Rate    : {r['fill_rate']:.1f}% ({r['filled_trades']:,} Filled / {r['unfilled_orders']:,} Unfilled Timeouts)")
+    print(f"  Execution Breakdown    : Maker: {r['maker_fills']:,} ($0 fee) | Taker: {r['taker_fills']:,} (Fees: ${r['taker_fees']:.2f})")
+    print("-" * 85)
     print(f"  Completed Campaigns    : {r['campaigns']:,} (Filter Skips: {r['filter_skips']:,})")
     print(f"  Campaign Win Rate      : {r['camp_wr']:.2f}% ({r['camp_wins']:,} Won / {r['camp_losses']:,} Lost)")
     
@@ -207,33 +269,31 @@ def print_single_summary(r: dict):
         step_str_parts.append(f"Step {s_idx+1}: {s_wins:,} ({pct:.1f}%)")
     print(f"  Step Wins Breakdown    : {' | '.join(step_str_parts)}")
     print(f"  Hard Cap Stop Losses   : {r['camp_losses']:,} campaigns (-${r['base_stake_usd'] * sum(r['multipliers']):.2f} each)")
-    print("-" * 80)
-    print(f"  Total Individual Bets  : {r['total_trades']:,} (Trade Win Rate: {r['trade_wr']:.2f}%)")
+    print("-" * 85)
     print(f"  Net Profit / Loss      : ${r['net_pnl']:+,.2f}")
     print(f"  Maximum Drawdown       : ${r['max_drawdown']:,.2f}")
     print(f"  Return / Drawdown Ratio: {r['ret_dd_ratio']:.2f}x")
-    print("=" * 80 + "\n")
+    print("=" * 85 + "\n")
 
 
 def print_comparison_table(results: list[dict]):
-    print("\n" + "=" * 135)
-    print("STRATEGY COMPARISON MATRIX")
-    print("=" * 135)
+    print("\n" + "=" * 145)
+    print("REAL ORDERBOOK TICK REPLAY COMPARISON MATRIX")
+    print("=" * 145)
     header = (
-        f"{'STRATEGY NAME':<38} | {'PATTERN':<18} | {'MULT':<16} | {'FILTER':<11} | {'PX':<5} | "
+        f"{'STRATEGY NAME':<38} | {'PX':<5} | {'FILL%':<6} | {'FILLED':<7} | {'UNFILLED':<8} | "
         f"{'CAMPS':<6} | {'C_WR':<7} | {'NET PNL':<12} | {'MAX DD':<9} | {'RET/DD':<7}"
     )
     print(header)
-    print("-" * 135)
+    print("-" * 145)
     for r in results:
         f_str = f"Body>={int(r['min_body'])}" if r['min_body'] > 0 else "None"
-        mult_str = str(tuple(r['multipliers']))
         row = (
             f"{r['strategy_name'][:38]:<38} | "
-            f"{r['pattern']:<18} | "
-            f"{mult_str:<16} | "
-            f"{f_str:<11} | "
             f"${r['entry_price']:.2f} | "
+            f"{r['fill_rate']:5.1f}% | "
+            f"{r['filled_trades']:<7} | "
+            f"{r['unfilled_orders']:<8} | "
             f"{r['campaigns']:<6} | "
             f"{r['camp_wr']:<6.1f}% | "
             f"${r['net_pnl']:<+11.2f} | "
@@ -241,98 +301,53 @@ def print_comparison_table(results: list[dict]):
             f"{r['ret_dd_ratio']:<6.2f}x"
         )
         print(row)
-    print("=" * 135 + "\n")
+    print("=" * 145 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kalshi Special Martingale Simulation & Comparison Runner")
-    parser.add_argument("--config", type=str, default="config.json", help="Path to config JSON file")
+    parser = argparse.ArgumentParser(description="Kalshi Special Martingale Simulation on Real Orderbook Data")
+    parser.add_argument("--config", type=str, default=os.path.join(SCRIPT_DIR, "config.json"), help="Path to config JSON file")
     parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR, help="Path to BTC market dataset")
+    parser.add_argument("--ob-cache", type=str, default=DEFAULT_OB_CACHE, help="Path to orderbook fill cache JSON")
     parser.add_argument("--compare", action="store_true", help="Run multi-strategy comparison suite")
     parser.add_argument("--base-stake", type=float, default=None, help="Override base stake USD")
-    parser.add_argument("--entry-price", type=float, default=None, help="Override maker entry price (e.g. 0.48, 0.50, 0.52)")
+    parser.add_argument("--entry-price", type=float, default=None, help="Override maker entry price (e.g. 0.20, 0.40, 0.45, 0.48)")
     parser.add_argument("--min-body", type=float, default=None, help="Override Binance candle body threshold")
 
     args = parser.parse_args()
 
     print(f"Loading market dataset from {args.data_dir}...")
-    outcomes, bodies, open_times, tickers = load_dataset(args.data_dir)
+    outcomes, bodies, open_times, slug_order, markets = load_dataset(args.data_dir)
     print(f"Loaded {len(outcomes):,} chronological beats ({open_times[0]} to {open_times[-1]}).")
 
-    if args.compare:
-        # Define comparison configurations
-        compare_configs = [
-            {
-                "name": "Pattern C (Body >= $75) [Recommended]",
-                "streak": 2,
-                "pattern": ("FADE", "FOLLOW", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0),
-                "min_body": 75.0,
-                "price": 0.48,
-            },
-            {
-                "name": "Pattern C (Body >= $75, Fair $0.50)",
-                "streak": 2,
-                "pattern": ("FADE", "FOLLOW", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0),
-                "min_body": 75.0,
-                "price": 0.50,
-            },
-            {
-                "name": "Pattern C (Body >= $75, Taker $0.52)",
-                "streak": 2,
-                "pattern": ("FADE", "FOLLOW", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0),
-                "min_body": 75.0,
-                "price": 0.52,
-            },
-            {
-                "name": "Pattern C (Gentle Multipliers 1-1.5-2.5)",
-                "streak": 2,
-                "pattern": ("FADE", "FOLLOW", "FADE"),
-                "multipliers": (1.0, 1.5, 2.5),
-                "min_body": 75.0,
-                "price": 0.48,
-            },
-            {
-                "name": "Pattern A (No Filter, Maker $0.48)",
-                "streak": 2,
-                "pattern": ("FADE", "FOLLOW", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0),
-                "min_body": 0.0,
-                "price": 0.48,
-            },
-            {
-                "name": "Baseline ALGO 3 (FOLLOW-FADE-FADE)",
-                "streak": 2,
-                "pattern": ("FOLLOW", "FADE", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0),
-                "min_body": 0.0,
-                "price": 0.48,
-            },
-            {
-                "name": "Pattern F Sniper (Streak 4, Body>=100)",
-                "streak": 4,
-                "pattern": ("FADE", "FOLLOW", "FADE", "FADE"),
-                "multipliers": (1.0, 2.0, 4.0, 8.0),
-                "min_body": 100.0,
-                "price": 0.48,
-            },
-        ]
+    ob_cache = None
+    if os.path.exists(args.ob_cache):
+        with open(args.ob_cache, "r", encoding="utf-8") as f:
+            ob_cache = json.load(f)
+        print(f"Loaded real orderbook tick depth cache for {len(ob_cache):,} beats.")
+    else:
+        print("[WARNING] orderbook_fill_cache.json not found! Running in flat fill mode.")
 
+    if args.compare:
+        prices_to_compare = [0.20, 0.40, 0.45, 0.48, 0.50, 0.52]
         base_stake = args.base_stake if args.base_stake is not None else 10.0
+        min_body = args.min_body if args.min_body is not None else 75.0
+
         results = []
-        for c in compare_configs:
+        for p in prices_to_compare:
+            name = f"Pattern C (Body>={int(min_body)}, Limit ${p:.2f})"
             r = simulate_martingale(
                 outcomes=outcomes,
                 bodies=bodies,
-                consecutive_streak_count=c["streak"],
-                pattern=c["pattern"],
-                multipliers=c["multipliers"],
+                slug_order=slug_order,
+                ob_cache=ob_cache,
+                consecutive_streak_count=2,
+                pattern=("FADE", "FOLLOW", "FADE"),
+                multipliers=(1.0, 2.0, 4.0),
                 base_stake_usd=base_stake,
-                min_body=c["min_body"],
-                entry_price=c["price"],
-                strategy_name=c["name"],
+                min_body=min_body,
+                entry_price=p,
+                strategy_name=name,
             )
             results.append(r)
 
@@ -340,13 +355,12 @@ def main():
 
     else:
         # Load single config
-        if not os.path.exists(args.config):
-            raise FileNotFoundError(f"Config file not found: {args.config}")
+        cfg = {}
+        if os.path.exists(args.config):
+            with open(args.config, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
 
-        with open(args.config, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        strategy_name = cfg.get("strategy_name", "Special Martingale")
+        strategy_name = cfg.get("strategy_name", "Special Martingale Pattern C")
         streak_count = cfg.get("consecutive_streak_count", 2)
         base_stake = args.base_stake if args.base_stake is not None else cfg.get("base_stake_usd", 10.0)
         multipliers = tuple(cfg.get("stake_multipliers", [1.0, 2.0, 4.0]))
@@ -359,21 +373,20 @@ def main():
         if args.min_body is not None:
             min_body = args.min_body
 
-        # Pattern mapping
         pattern = ("FADE", "FOLLOW", "FADE")
-        if "algo 3" in strategy_name.lower():
-            pattern = ("FOLLOW", "FADE", "FADE")
 
         res = simulate_martingale(
             outcomes=outcomes,
             bodies=bodies,
+            slug_order=slug_order,
+            ob_cache=ob_cache,
             consecutive_streak_count=streak_count,
             pattern=pattern,
             multipliers=multipliers,
             base_stake_usd=base_stake,
             min_body=min_body,
             entry_price=price,
-            strategy_name=strategy_name,
+            strategy_name=f"{strategy_name} (${price:.2f})",
         )
 
         print_single_summary(res)
