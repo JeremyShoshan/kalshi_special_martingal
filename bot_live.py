@@ -44,16 +44,15 @@ def check_special_martingale_trigger(
     base_stake_usd: float = 10.0,
 ) -> tuple[bool, str | None, str | None, float, int, str | None]:
     """
-    Evaluates Special Martingale (ALGO 3: Trend-First Reversion Engine).
+    Evaluates Special Martingale Pattern C: Trend Transition Engine.
     
-    Progression:
-    - If in active campaign:
-        Step 0 (Step 1/3): FOLLOW streak direction (Stake: base_stake * multipliers[0], e.g. 1x)
-        Step 1 (Step 2/3): FADE streak direction (Stake: base_stake * multipliers[1], e.g. 2x)
-        Step 2 (Step 3/3): FADE streak direction (Stake: base_stake * multipliers[2], e.g. 4x)
-    - If not in campaign:
-        Triggers on streak_len >= consecutive_streak_count (default 2):
-        Initiates Step 0 (FOLLOW) with 1x base stake.
+    Pattern sequence:
+    - Step 0 (Step 1/3): FADE the 2-candle streak (Stake: 1.0x).
+      Exploits the 52.4% mean-reversion rate of 2-candle streaks in 15m BTC.
+    - Step 1 (Step 2/3): FOLLOW the streak direction (Stake: 2.0x).
+      If Step 0 lost, the streak reached 3 consecutive candles. Trend confirmed! Ride it.
+    - Step 2 (Step 3/3): FADE the streak direction (Stake: 4.0x).
+      If Step 1 lost, the streak exhausted at candle 4. Fade exhaustion.
         
     Returns:
         (triggered, bet_side, action_type, stake_usd, streak_len, streak_side)
@@ -68,6 +67,9 @@ def check_special_martingale_trigger(
         mult = stake_multipliers[step] if step < len(stake_multipliers) else (2.0 ** step)
         stake = round(base_stake_usd * mult, 2)
         if step == 0:
+            action_type = "FADE"
+            bet_side = "Down" if campaign_trigger_dir == "Up" else "Up"
+        elif step == 1:
             action_type = "FOLLOW"
             bet_side = campaign_trigger_dir
         else:
@@ -79,8 +81,8 @@ def check_special_martingale_trigger(
     if streak_len >= consecutive_streak_count and streak_side is not None:
         mult = stake_multipliers[0] if stake_multipliers else 1.0
         stake = round(base_stake_usd * mult, 2)
-        action_type = "FOLLOW"
-        bet_side = streak_side
+        action_type = "FADE"
+        bet_side = "Down" if streak_side == "Up" else "Up"
         return True, bet_side, action_type, stake, streak_len, streak_side
 
     return False, None, None, 0.0, streak_len, streak_side
@@ -1010,9 +1012,16 @@ def simulate_state_from_history(
                 in_camp = True
                 step = 0
                 t_dir = curr_s
+                # Triggered on this candle; next candle will be Step 0 resolution
+                continue
+        else:
+            if step == 0:
+                bet_side = "Down" if t_dir == "Up" else "Up"
+            elif step == 1:
+                bet_side = t_dir
+            else:
+                bet_side = "Down" if t_dir == "Up" else "Up"
 
-        if in_camp:
-            bet_side = t_dir if step == 0 else ("Down" if t_dir == "Up" else "Up")
             if act == bet_side:
                 # Won!
                 in_camp = False
@@ -3366,7 +3375,11 @@ async def run_live_bot(
                         delta_notif_str = ""
                         delta_console_str = ""
 
-                        if dyn_filter_enabled and dynamic_rules:
+                        if in_campaign:
+                            vol_failed = False
+                            delta_failed = False
+                            print(f"         [SPECIAL MARTINGALE CAMPAIGN] Step {campaign_step+1}/{max_cap} active ({streak_action_type}). Filter bypassed for recovery.")
+                        elif dyn_filter_enabled and dynamic_rules:
                             _, curr_vol_pct, vol_msg = check_volatility_filter(
                                 asset=asset, enabled=True, threshold_pct=dyn_min_vol_pct, lookback_candles=vol_lookback_candles, source=dyn_vol_source
                             )

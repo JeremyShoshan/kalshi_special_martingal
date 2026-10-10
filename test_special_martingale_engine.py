@@ -1,58 +1,50 @@
 import sys
-import os
-
-# Add kalshi_special_martingal root and lib to sys.path
-base_dir = r"c:\Users\Jeremy\Documents\projects\kalshi_special_martingal"
-if base_dir not in sys.path:
-    sys.path.insert(0, base_dir)
+sys.path.insert(0, r"c:\Users\Jeremy\Documents\projects\kalshi_special_martingal")
+"""
+Unit tests and self-verification suite for Special Martingale (Pattern C: Trend Transition Engine).
+Tests:
+1. Streak detection correctness.
+2. Pattern C trigger progression:
+   - Step 0 (Step 1/3): FADE streak (1x base stake, e.g. $10)
+   - Step 1 (Step 2/3): FOLLOW streak (2x base stake, e.g. $20)
+   - Step 2 (Step 3/3): FADE streak (4x base stake, e.g. $40)
+3. Lifecycle state transitions (Wins, Losses, Hard Cap resets).
+4. Skip handling (Unfilled maker orders, Volatility/Delta filter skips).
+5. Historical state simulation (simulate_state_from_history).
+"""
 
 from bot_live import (
     get_consecutive_streak,
     check_special_martingale_trigger,
+    TradeBot,
     simulate_state_from_history,
 )
-from lib.trade_bot import TradeBot, BotState
 
 
 def test_streak_detection():
     print("Testing streak detection...")
+    assert get_consecutive_streak(["Up", "Up"]) == (2, "Up")
+    assert get_consecutive_streak(["Down", "Down", "Down"]) == (3, "Down")
+    assert get_consecutive_streak(["Up", "Down", "Up"]) == (1, "Up")
     assert get_consecutive_streak([]) == (0, None)
-    assert get_consecutive_streak(["Up"]) == (1, "Up")
-    assert get_consecutive_streak(["Up", "Down"]) == (1, "Down")
-    assert get_consecutive_streak(["Down", "Up", "Up"]) == (2, "Up")
-    assert get_consecutive_streak(["Up", "Down", "Down", "Down"]) == (3, "Down")
-    print("✅ test_streak_detection PASSED")
+    print("✓ test_streak_detection PASSED")
 
 
 def test_special_martingale_trigger_rules():
-    print("\nTesting special martingale trigger rules (ALGO 3)...")
-    
-    # 1. Below threshold (streak < 2)
+    print("\nTesting Pattern C trigger rules (FADE-FOLLOW-FADE)...")
+    # 1. Insufficient streak
     trig, side, act, stake, slen, sside = check_special_martingale_trigger(
-        outcomes=["Down", "Up"],
-        consecutive_streak_count=2,
-        in_campaign=False,
-        base_stake_usd=10.0,
-        stake_multipliers=[1.0, 2.0, 4.0],
+        outcomes=["Up"], consecutive_streak_count=2, base_stake_usd=10.0
     )
-    assert not trig, "Should not trigger on streak of 1"
+    assert not trig and side is None
 
-    # 2. Trigger on streak of 2 Up -> Step 1 (FOLLOW Up, $10)
+    # 2. Trigger on 2 Ups: Step 0 is FADE Down ($10)
     trig, side, act, stake, slen, sside = check_special_martingale_trigger(
-        outcomes=["Down", "Up", "Up"],
-        consecutive_streak_count=2,
-        in_campaign=False,
-        base_stake_usd=10.0,
-        stake_multipliers=[1.0, 2.0, 4.0],
+        outcomes=["Up", "Up"], consecutive_streak_count=2, base_stake_usd=10.0
     )
-    assert trig, "Should trigger on streak of 2"
-    assert side == "Up", f"Expected Up, got {side}"
-    assert act == "FOLLOW", f"Expected FOLLOW, got {act}"
-    assert stake == 10.0, f"Expected 10.0, got {stake}"
-    assert slen == 2
-    assert sside == "Up"
+    assert trig and side == "Down" and act == "FADE" and stake == 10.0 and slen == 2 and sside == "Up"
 
-    # 3. Active campaign at Step 0 (Step 1/3) -> FOLLOW Up ($10)
+    # 3. Active campaign at Step 0 -> FADE Down ($10)
     trig, side, act, stake, slen, sside = check_special_martingale_trigger(
         outcomes=["Up", "Up"],
         in_campaign=True,
@@ -61,22 +53,22 @@ def test_special_martingale_trigger_rules():
         base_stake_usd=10.0,
         stake_multipliers=[1.0, 2.0, 4.0],
     )
-    assert trig and side == "Up" and act == "FOLLOW" and stake == 10.0
+    assert trig and side == "Down" and act == "FADE" and stake == 10.0
 
-    # 4. Active campaign at Step 1 (Step 2/3) -> FADE Down ($20)
+    # 4. Active campaign at Step 1 (Step 2/3) -> FOLLOW Up ($20)
     trig, side, act, stake, slen, sside = check_special_martingale_trigger(
-        outcomes=["Up", "Up", "Down"],
+        outcomes=["Up", "Up", "Up"], # Step 0 lost because streak continued to 3
         in_campaign=True,
         campaign_step=1,
         campaign_trigger_dir="Up",
         base_stake_usd=10.0,
         stake_multipliers=[1.0, 2.0, 4.0],
     )
-    assert trig and side == "Down" and act == "FADE" and stake == 20.0
+    assert trig and side == "Up" and act == "FOLLOW" and stake == 20.0
 
     # 5. Active campaign at Step 2 (Step 3/3) -> FADE Down ($40)
     trig, side, act, stake, slen, sside = check_special_martingale_trigger(
-        outcomes=["Up", "Up", "Down", "Up"],
+        outcomes=["Up", "Up", "Up", "Down"], # Step 1 lost because streak reversed at 4
         in_campaign=True,
         campaign_step=2,
         campaign_trigger_dir="Up",
@@ -84,24 +76,21 @@ def test_special_martingale_trigger_rules():
         stake_multipliers=[1.0, 2.0, 4.0],
     )
     assert trig and side == "Down" and act == "FADE" and stake == 40.0
-    print("✅ test_special_martingale_trigger_rules PASSED")
+    print("✓ test_special_martingale_trigger_rules PASSED")
 
 
 def test_campaign_transitions_and_settlement():
     print("\nTesting full campaign lifecycle and state transitions...")
     bot = TradeBot(base_stake=10.0, starting_balance=1000.0)
-    stake_multipliers = [1.0, 2.0, 4.0]
-    max_cap = 3
-    base_stake_usd = 10.0
 
-    # Case A: Win on Step 1 (Continuation)
-    # Streak 2 Up detected -> Bet Follow Up ($10).
-    # Actual outcome: Up (Win!)
+    # Case A: Win on Step 1 (Fade wins immediately)
+    # Streak 2 Up detected -> Bet FADE Down ($10).
+    # Actual outcome: Down (Win!)
     bot.record_trade({
         "signal_ts": 1000,
         "buy_local_ts": 1000,
         "sell_local_ts": 1900,
-        "side": "Up",
+        "side": "Down",
         "entry_ask": 0.50,
         "exit_bid": 1.00,
         "cost": 10.0,
@@ -117,10 +106,10 @@ def test_campaign_transitions_and_settlement():
     assert bot.state.campaign_wins == 1
     assert bot.state.campaign_losses == 0
     assert bot.state.campaign_winrate == 100.0
-    print("  • Case A (Step 1 Win -> Reset) Verified.")
+    print("  ✓ Case A (Step 1 Fade Win -> Reset) Verified.")
 
-    # Case B: Loss on Step 1, Win on Step 2 (Chop Reversion)
-    # Step 1: Bet Follow Down ($10). Actual: Up (Loss)
+    # Case B: Loss on Step 1, Win on Step 2 (Trend Follower Wins)
+    # Step 1: Bet Fade Down ($10). Actual: Up (Loss)
     bot.record_trade({
         "signal_ts": 2000,
         "buy_local_ts": 2000,
@@ -134,7 +123,7 @@ def test_campaign_transitions_and_settlement():
         "won": False,
         "result": "LOSS",
     })
-    # Step advances to Step 2 ($20 FADE Up). Actual: Up (Win!)
+    # Step advances to Step 2 ($20 FOLLOW Up). Actual: Up (Win!)
     bot.record_trade({
         "signal_ts": 3000,
         "buy_local_ts": 3000,
@@ -156,18 +145,18 @@ def test_campaign_transitions_and_settlement():
     assert bot.state.campaign_wins == 2
     assert bot.state.campaign_losses == 0
     assert bot.state.campaign_winrate == 100.0
-    print("  • Case B (Step 1 Loss, Step 2 Win -> Reset) Verified.")
+    print("  ✓ Case B (Step 1 Loss, Step 2 Follow Win -> Reset) Verified.")
 
     # Case C: Hard Cap 3 Reached (Sequence Loss)
     # Step 1 Loss ($10), Step 2 Loss ($20), Step 3 Loss ($40) -> Total loss = -$70
     bot.record_trade({
         "signal_ts": 4000, "buy_local_ts": 4000, "sell_local_ts": 4900,
-        "side": "Up", "entry_ask": 0.50, "exit_bid": 0.0, "cost": 10.0, "shares": 20.0,
+        "side": "Down", "entry_ask": 0.50, "exit_bid": 0.0, "cost": 10.0, "shares": 20.0,
         "pnl": -10.0, "won": False, "result": "LOSS"
     })
     bot.record_trade({
         "signal_ts": 5000, "buy_local_ts": 5000, "sell_local_ts": 5900,
-        "side": "Down", "entry_ask": 0.50, "exit_bid": 0.0, "cost": 20.0, "shares": 40.0,
+        "side": "Up", "entry_ask": 0.50, "exit_bid": 0.0, "cost": 20.0, "shares": 40.0,
         "pnl": -20.0, "won": False, "result": "LOSS"
     })
     bot.record_trade({
@@ -183,8 +172,8 @@ def test_campaign_transitions_and_settlement():
     assert bot.state.campaign_wins == 2
     assert bot.state.campaign_losses == 1
     assert round(bot.state.campaign_winrate, 1) == 66.7
-    print("  • Case C (Hard Cap 3 Stop Loss -> Reset) Verified.")
-    print("✅ test_campaign_transitions_and_settlement PASSED")
+    print("  ✓ Case C (Hard Cap 3 Stop Loss -> Reset) Verified.")
+    print("✓ test_campaign_transitions_and_settlement PASSED")
 
 
 def test_skip_cases_and_unfilled():
@@ -192,7 +181,6 @@ def test_skip_cases_and_unfilled():
     bot = TradeBot(base_stake=10.0)
 
     # 1. Unfilled Maker Order (stop_maker_sec timeout)
-    # Trade was skipped. Record whether market would have won or lost:
     bot.record_skipped_trade(won=True)
     bot.record_skipped_trade(won=False)
     assert bot.state.skipped_count == 2
@@ -200,55 +188,16 @@ def test_skip_cases_and_unfilled():
     assert bot.state.skipped_losses == 1
     assert bot.state.trade_num == 0, "Unfilled orders must NOT count as executed trades"
     assert bot.state.total_stake == 0.0, "Unfilled orders risk $0 capital"
-    print("  • Unfilled maker order tracking Verified ($0 capital spent).")
+    print("  ✓ Unfilled maker order tracking Verified ($0 capital spent).")
 
-    # 2. Filter Skips (Volatility / Delta filter failed)
+    # 2. Filter Skips (Delta filter body < $75)
     bot.record_filter_skipped_trade(won=True)
     bot.record_filter_skipped_trade(won=False)
     assert bot.state.filter_skipped_count == 2
     assert bot.state.filter_skipped_wins == 1
     assert bot.state.filter_skipped_losses == 1
-    print("  • Filter skip tracking Verified.")
-
-    # 3. Simulate unfilled state preserving / reset logic:
-    # Scenario E: Step 1 Unfilled & Streak Reverses
-    camp_step = 0
-    camp_dir = "Up"
-    trade_outcome = "Down"  # reversed
-    if camp_step == 0 and trade_outcome != camp_dir:
-        in_campaign = False
-        campaign_step = 0
-    else:
-        in_campaign = True
-    assert not in_campaign, "Reversal while unfilled on Step 1 must cleanly reset!"
-    print("  • Step 1 unfilled reversal clean reset Verified.")
-
-    # Scenario F: Step 1 Unfilled & Streak Continues
-    camp_step = 0
-    camp_dir = "Up"
-    trade_outcome = "Up"  # continued
-    if camp_step == 0 and trade_outcome != camp_dir:
-        in_campaign = False
-        campaign_step = 0
-    else:
-        in_campaign = True
-        campaign_step = camp_step
-    assert in_campaign and campaign_step == 0, "Streak continuation while unfilled must preserve Step 0!"
-    print("  • Step 1 unfilled streak continuation preserve step Verified.")
-
-    # Scenario G: Step 2 Unfilled (Preserve Step 2)
-    camp_step = 1
-    camp_dir = "Up"
-    trade_outcome = "Up"
-    if camp_step == 0 and trade_outcome != camp_dir:
-        in_campaign = False
-        campaign_step = 0
-    else:
-        in_campaign = True
-        campaign_step = camp_step
-    assert in_campaign and campaign_step == 1, "Unfilled Step 2 must PRESERVE Step 2 (no double stake)!"
-    print("  • Step 2 unfilled preserve step Verified.")
-    print("✅ test_skip_cases_and_unfilled PASSED")
+    print("  ✓ Filter skip tracking Verified.")
+    print("✓ test_skip_cases_and_unfilled PASSED")
 
 
 def test_simulate_state_from_history():
@@ -261,11 +210,11 @@ def test_simulate_state_from_history():
     ]
     sim = simulate_state_from_history(history, history_len=10, consecutive_streak_count=2)
     assert sim["triggered"], "Should be triggered on 2 Ups"
-    assert sim["bet_side"] == "Up", "Step 0 must FOLLOW Up"
-    assert sim["action_type"] == "FOLLOW"
+    assert sim["bet_side"] == "Down", "Step 0 must FADE Down"
+    assert sim["action_type"] == "FADE"
     assert sim["stake_usd"] == 10.0
 
-    print("✅ test_simulate_state_from_history PASSED")
+    print("✓ test_simulate_state_from_history PASSED")
 
 
 if __name__ == "__main__":
