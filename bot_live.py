@@ -77,8 +77,8 @@ def check_special_martingale_trigger(
             bet_side = "Down" if campaign_trigger_dir == "Up" else "Up"
         return True, bet_side, action_type, stake, streak_len, streak_side
 
-    # Not currently in active campaign: check for new trigger
-    if streak_len >= consecutive_streak_count and streak_side is not None:
+    # Not currently in active campaign: trigger only on fresh streak of 2
+    if streak_len == consecutive_streak_count and streak_side is not None:
         mult = stake_multipliers[0] if stake_multipliers else 1.0
         stake = round(base_stake_usd * mult, 2)
         action_type = "FADE"
