@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Secrets and credentials (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and local state
+logs/
+*.log
+state*.json
+*.tmp
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

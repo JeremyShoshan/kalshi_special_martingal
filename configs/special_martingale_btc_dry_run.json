@@ -1,0 +1,47 @@
+{
+  "strategy_name": "ALGO 3 - Special Martingale (Trend-First Reversion Engine)",
+  "mode": "dry_run",
+  "asset": "BTC",
+  "consecutive_streak_count": 2,
+  "base_stake_usd": 10.0,
+  "stake_multipliers": [
+    1.0,
+    2.0,
+    4.0
+  ],
+  "max_cap": 3,
+  "cap": 3,
+  "fade_stake_usd": 10.0,
+  "fade_profit_target_usd": null,
+  "max_transactions": null,
+  "decisive_up": 0.9,
+  "decisive_down": 0.1,
+  "seconds_before_close": 15,
+  "history_beats_count": 50,
+  "beat_duration_min": 15,
+  "stop_maker_sec": 240,
+  "min_maker_sec": 0,
+  "max_maker_price": 0.52,
+  "marketable_limit": true,
+  "taker_limit_price": null,
+  "active_order_adjusted": false,
+  "enable_price_savings_bank": false,
+  "notifications": true,
+  "state_file": null,
+  "reset_state": false,
+  "volatility_filter": {
+    "enabled": false,
+    "threshold_pct": 0.13,
+    "lookback_candles": 16
+  },
+  "delta_filter": {
+    "enabled": false,
+    "delta_max_range": 220.0,
+    "delta_threshold": 75.0,
+    "source": "binance"
+  },
+  "take_profit": {
+    "enabled": false,
+    "target_pct": 0.14
+  }
+}
