@@ -21,6 +21,9 @@ logs/
 state*.json
 *.tmp
 
+# Simulation tape cache (parsed order book / trades per day)
+.sim_cache/
+
 # IDE / System
 .vscode/
 .idea/

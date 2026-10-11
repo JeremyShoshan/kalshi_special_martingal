@@ -1,13 +1,18 @@
 {
-  "strategy_name": "ALGO Trend Transition (Pattern C: FADE-FOLLOW-FADE)",
+  "strategy_name": "ALGO Streak3 Double-Fade Breakout (FADE-FADE-FOLLOW)",
   "mode": "dry_run",
   "asset": "BTC",
-  "consecutive_streak_count": 2,
+  "consecutive_streak_count": 3,
+  "pattern": [
+    "FADE",
+    "FADE",
+    "FOLLOW"
+  ],
   "base_stake_usd": 10.0,
   "stake_multipliers": [
     1.0,
     2.0,
-    4.0
+    3.0
   ],
   "max_cap": 3,
   "cap": 3,
@@ -19,13 +24,14 @@
   "seconds_before_close": 15,
   "history_beats_count": 50,
   "beat_duration_min": 15,
-  "stop_maker_sec": 240,
-  "min_maker_sec": 0,
-  "max_maker_price": 0.48,
+  "min_maker_sec": 15,
+  "stop_maker_sec": 120,
+  "max_maker_price": 0.45,
   "marketable_limit": true,
   "taker_limit_price": null,
   "active_order_adjusted": false,
   "enable_price_savings_bank": false,
+  "sync_corrections": false,
   "notifications": true,
   "state_file": null,
   "reset_state": false,
@@ -37,7 +43,7 @@
   "delta_filter": {
     "enabled": true,
     "delta_max_range": null,
-    "delta_threshold": 75.0,
+    "delta_threshold": 50.0,
     "source": "binance"
   },
   "take_profit": {

@@ -1,4 +1,4 @@
-{
+> uv run python run_simulation.py --min-body 100  --entry-price 0.20{
   "strategy_name": "ALGO Trend Transition (Pattern C: FADE-FOLLOW-FADE)",
   "mode": "real",
   "asset": "BTC",

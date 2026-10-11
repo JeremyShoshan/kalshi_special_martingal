@@ -4,7 +4,29 @@ A high-performance algorithmic trading engine designed for Kalshi crypto 15-minu
 
 ---
 
-## 🚀 Strategy Architecture: Pattern C ("Trend Transition Engine")
+## ✅ Active Strategy (config.json): Streak-3 Double-Fade Breakout (FADE-FADE-FOLLOW)
+
+Selected by the real order-book pattern search (`research/martingale_pattern_search.py`, 55 days BTC_250).
+
+| Step | Action | Stake | Meaning |
+| :---: | :---: | :---: | :--- |
+| Trigger | - | - | exactly **3** consecutive same-side beats, last beat body >= **$50** (Binance) |
+| 1 | FADE | 1x ($10) | bet the streak reverses |
+| 2 | FADE | 2x ($20) | streak hit 4 - fade again |
+| 3 | FOLLOW | 3x ($30) | streak hit 5 - breakout confirmed, ride it; loss = hard cap |
+
+Execution: marketable limit **$0.45**, order sent **15s** into the beat (after the previous beat settles), unfilled remainder cancelled at **120s**, no taker fallback.
+
+Real replay (strict fills, $10 base): **+$1,067.83**, max DD **$148.45**, campaign win rate **88.9%** (217/27), fill rate 66%, fees $89.83; all 4 chronological blocks positive.
+
+Live-engine notes:
+- `pattern` (list of FADE/FOLLOW per step) is configurable; default stays FADE-FOLLOW-FADE.
+- After every settled result the bot recomputes the next step's side/stake from `pattern`; the delayed entry waits until the previous beat is evaluated (never trades a stale step).
+- Legacy history-based sync corrections are off (`sync_corrections: false`); the replay never used them.
+
+---
+
+## 🚀 Strategy Architecture (legacy): Pattern C ("Trend Transition Engine")
 
 Conventional martingales fail because:
 - **Pure Fading (Mean Reversion):** Bleeds catastrophic capital when BTC enters prolonged trending runs (5–8 consecutive green/red candles).
@@ -33,6 +55,11 @@ Conventional martingales fail because:
 
 ## 📊 Backtest Performance (All 5,219 Beats / 56 Days)
 
+> [!WARNING]
+> The table below assumes **every order fills 100% at a fixed price** (no order book). Replaying the
+> same signals against the real Kalshi order book + trade tape (`combined_dataset\BTC_250`) changes the
+> picture completely - see **Real Order Book Replay** right after the table.
+
 Evaluated under **strict forward out-of-sample execution** across all 5,219 chronological 15m beats in `combined_dataset\BTC` (Aug 13 – Oct 07, 2026):
 
 | Metric | Pattern C (`Body >= $75`) | Unfiltered Pattern A | Baseline ALGO 3 |
@@ -47,6 +74,23 @@ Evaluated under **strict forward out-of-sample execution** across all 5,219 chro
 | **Return / Max Drawdown Ratio** | **7.98x** | 9.14x | 3.96x |
 
 > **Key Advantage:** Pattern C is **profitable across all pricing conditions**, generating +$589.23 even under worst-case $0.52 taker drag where ALGO 3 loses -$1,391.54.
+
+### Real Order Book Replay (`run_simulation.py`, BTC_250, Body >= $75, base $10)
+
+Each order is replayed exactly like `bot_live.py` sends it (marketable limit at `max_maker_price`, taker at the
+best ask if it is <= limit, otherwise resting maker filled only by real tape prints at/through the limit,
+cancel at `stop_maker_sec`, Kalshi fees, partial fills, unfilled-skip rules, decisive-close trigger).
+
+| Limit | Ideal (old assumption) | Real replay - strict | Real replay - queue(100) | Real replay - touch (optimistic) |
+| :---: | :---: | :---: | :---: | :---: |
+| $0.45 | +$3,064 | **-$537** | -$416 | -$367 |
+| $0.48 | +$1,824 | **-$85** (DD $531) | +$257 | +$307 |
+| $0.50 | +$1,080 | **-$30** | +$330 | +$450 |
+| $0.52 | +$393 | **+$182** (DD $391) | +$105 | +$120 |
+
+Why the edge disappears: **adverse selection + fees**. Orders that never fill are the ones that would
+have won (75% win rate on unfilled orders), while resting bids that do get hit win far less often
+(Step 1 maker fills proven by a seller crossing below the bid win only ~32%). Taker fills pay ~$230 in fees.
 
 ---
 
@@ -67,23 +111,27 @@ Evaluated under **strict forward out-of-sample execution** across all 5,219 chro
 
 ```json
 {
-  "strategy_name": "ALGO Trend Transition (Pattern C: FADE-FOLLOW-FADE)",
+  "strategy_name": "ALGO Streak3 Double-Fade Breakout (FADE-FADE-FOLLOW)",
   "mode": "dry_run",
   "asset": "BTC",
-  "consecutive_streak_count": 2,
+  "consecutive_streak_count": 3,
+  "pattern": ["FADE", "FADE", "FOLLOW"],
   "base_stake_usd": 10.0,
-  "stake_multipliers": [1.0, 2.0, 4.0],
+  "stake_multipliers": [1.0, 2.0, 3.0],
   "max_cap": 3,
   "cap": 3,
-  "stop_maker_sec": 240,
-  "max_maker_price": 0.48,
+  "min_maker_sec": 15,
+  "stop_maker_sec": 120,
+  "max_maker_price": 0.45,
   "marketable_limit": true,
+  "taker_limit_price": null,
+  "sync_corrections": false,
   "beat_duration_min": 15,
   "notifications": true,
   "delta_filter": {
     "enabled": true,
     "delta_max_range": null,
-    "delta_threshold": 75.0,
+    "delta_threshold": 50.0,
     "source": "binance"
   }
 }
@@ -96,6 +144,16 @@ Evaluated under **strict forward out-of-sample execution** across all 5,219 chro
 ### 1. Run Verification Suite (Unit Tests)
 ```powershell
 uv run python test_special_martingale_engine.py
+uv run python run_simulation.py --config config.json --trades-out logs/streak3_trades.csv
+uv run python test_streak3_pattern.py   # cross-checks every replay order vs bot_live state machine
+```
+
+### 1b. Real Order Book Replay Simulation
+```powershell
+uv run python run_simulation.py                                  # config.json, strict maker fills
+uv run python run_simulation.py --compare                        # fill model x limit price matrix
+uv run python run_simulation.py --fill-model queue --queue-ahead 200 --trades-out logs/sim.csv
+uv run python run_simulation.py --decision result --maker-fee 0.0175 --start-date 2026-09-01
 ```
 
 ### 2. Paper Trading / Dry-Run Mode

@@ -33,6 +33,42 @@ def get_consecutive_streak(outcomes: list[str]) -> tuple[int, str | None]:
     return streak_len, streak_side
 
 
+DEFAULT_PATTERN = ["FADE", "FOLLOW", "FADE"]
+
+
+def normalize_pattern(pattern: Any) -> list[str]:
+    """Parse/validate a campaign pattern (list or 'FADE,FADE,FOLLOW' string)."""
+    if pattern is None:
+        return list(DEFAULT_PATTERN)
+    if isinstance(pattern, str):
+        pattern = [p for p in re.split(r"[,\s\-]+", pattern) if p]
+    out = [str(p).strip().upper() for p in pattern]
+    if not out or any(p not in ("FADE", "FOLLOW") for p in out):
+        raise ValueError(f"Invalid pattern {pattern!r}: use only FADE / FOLLOW")
+    return out
+
+
+def get_campaign_bet(
+    campaign_step: int,
+    campaign_trigger_dir: str,
+    pattern: list[str] | None = None,
+    stake_multipliers: list[float] | None = None,
+    base_stake_usd: float = 10.0,
+    max_cap: int = 3,
+) -> tuple[str, str, float]:
+    """Return (action_type, bet_side, stake_usd) for a campaign step."""
+    pattern = normalize_pattern(pattern)
+    if stake_multipliers is None:
+        stake_multipliers = [1.0, 2.0, 4.0]
+    step = max(0, min(campaign_step, max_cap - 1))
+    mult = stake_multipliers[step] if step < len(stake_multipliers) else (2.0 ** step)
+    stake = round(base_stake_usd * mult, 2)
+    action_type = pattern[step] if step < len(pattern) else pattern[-1]
+    fade_side = "Down" if campaign_trigger_dir == "Up" else "Up"
+    bet_side = campaign_trigger_dir if action_type == "FOLLOW" else fade_side
+    return action_type, bet_side, stake
+
+
 def check_special_martingale_trigger(
     outcomes: list[str],
     consecutive_streak_count: int = 2,
@@ -42,6 +78,7 @@ def check_special_martingale_trigger(
     max_cap: int = 3,
     stake_multipliers: list[float] | None = None,
     base_stake_usd: float = 10.0,
+    pattern: list[str] | None = None,
 ) -> tuple[bool, str | None, str | None, float, int, str | None]:
     """
     Evaluates Special Martingale Pattern C: Trend Transition Engine.
@@ -53,36 +90,31 @@ def check_special_martingale_trigger(
       If Step 0 lost, the streak reached 3 consecutive candles. Trend confirmed! Ride it.
     - Step 2 (Step 3/3): FADE the streak direction (Stake: 4.0x).
       If Step 1 lost, the streak exhausted at candle 4. Fade exhaustion.
+    Pattern is configurable via ``pattern`` (default FADE, FOLLOW, FADE).
+    e.g. ["FADE", "FADE", "FOLLOW"] = Streak-3 Double-Fade Breakout:
+    fade the streak twice, then follow it if it keeps extending.
         
     Returns:
         (triggered, bet_side, action_type, stake_usd, streak_len, streak_side)
     """
     if stake_multipliers is None:
         stake_multipliers = [1.0, 2.0, 4.0]
+    pattern = normalize_pattern(pattern)
 
     streak_len, streak_side = get_consecutive_streak(outcomes)
 
     if in_campaign and campaign_trigger_dir is not None:
-        step = min(campaign_step, max_cap - 1)
-        mult = stake_multipliers[step] if step < len(stake_multipliers) else (2.0 ** step)
-        stake = round(base_stake_usd * mult, 2)
-        if step == 0:
-            action_type = "FADE"
-            bet_side = "Down" if campaign_trigger_dir == "Up" else "Up"
-        elif step == 1:
-            action_type = "FOLLOW"
-            bet_side = campaign_trigger_dir
-        else:
-            action_type = "FADE"
-            bet_side = "Down" if campaign_trigger_dir == "Up" else "Up"
+        action_type, bet_side, stake = get_campaign_bet(
+            campaign_step, campaign_trigger_dir, pattern,
+            stake_multipliers, base_stake_usd, max_cap,
+        )
         return True, bet_side, action_type, stake, streak_len, streak_side
 
-    # Not currently in active campaign: trigger only on fresh streak of 2
+    # Not currently in active campaign: trigger only on a fresh streak of exactly N
     if streak_len == consecutive_streak_count and streak_side is not None:
-        mult = stake_multipliers[0] if stake_multipliers else 1.0
-        stake = round(base_stake_usd * mult, 2)
-        action_type = "FADE"
-        bet_side = "Down" if streak_side == "Up" else "Up"
+        action_type, bet_side, stake = get_campaign_bet(
+            0, streak_side, pattern, stake_multipliers, base_stake_usd, max_cap,
+        )
         return True, bet_side, action_type, stake, streak_len, streak_side
 
     return False, None, None, 0.0, streak_len, streak_side
@@ -978,6 +1010,7 @@ def simulate_state_from_history(
     max_cap: int = 3,
     stake_multipliers: list[float] | None = None,
     base_stake_usd: float = 10.0,
+    pattern: list[str] | None = None,
 ) -> dict:
     """
     Computes lookback counts and campaign state from the most recent history_len resolved outcomes.
@@ -985,6 +1018,7 @@ def simulate_state_from_history(
     """
     if stake_multipliers is None:
         stake_multipliers = [1.0, 2.0, 4.0]
+    pattern = normalize_pattern(pattern)
     if cap is not None and cap > 0:
         max_cap = cap
 
@@ -1015,12 +1049,9 @@ def simulate_state_from_history(
                 # Triggered on this candle; next candle will be Step 0 resolution
                 continue
         else:
-            if step == 0:
-                bet_side = "Down" if t_dir == "Up" else "Up"
-            elif step == 1:
-                bet_side = t_dir
-            else:
-                bet_side = "Down" if t_dir == "Up" else "Up"
+            _, bet_side, _ = get_campaign_bet(
+                step, t_dir, pattern, stake_multipliers, base_stake_usd, max_cap
+            )
 
             if act == bet_side:
                 # Won!
@@ -1046,6 +1077,7 @@ def simulate_state_from_history(
         max_cap=max_cap,
         stake_multipliers=stake_multipliers,
         base_stake_usd=base_stake_usd,
+        pattern=pattern,
     )
 
     return {
@@ -1140,6 +1172,8 @@ async def run_live_bot(
     take_profit_config: dict | None = None,
     delta_filter_config: dict | None = None,
     dynamic_filter_config: dict | None = None,
+    pattern: list[str] | None = None,
+    sync_corrections: bool = False,
 ):
     global subscribed_assets
     if fade_stake_usd is not None and fade_stake_usd > 0:
@@ -1148,6 +1182,11 @@ async def run_live_bot(
         max_cap = cap
     if stake_multipliers is None:
         stake_multipliers = [1.0, 2.0, 4.0]
+    pattern = normalize_pattern(pattern)
+    if len(pattern) < max_cap or len(stake_multipliers) < max_cap:
+        print(f"⚠️ WARNING: pattern ({len(pattern)}) / stake_multipliers ({len(stake_multipliers)}) shorter than max_cap ({max_cap}); missing steps reuse last action / 2^step stake.")
+    if not min_maker_sec or min_maker_sec <= 0:
+        print("⚠️ WARNING: min_maker_sec = 0 places campaign orders at beat start, before the previous beat settles (step may be stale). Recommended: min_maker_sec >= 15.")
 
     asset_emoji = "₿" if asset == "BTC" else "⟠" if asset == "ETH" else "🪙"
     starting_balance = 1000.0 if mode == BotMode.DRY_RUN else 0.0
@@ -1233,6 +1272,8 @@ async def run_live_bot(
     print(f"Decision window: {seconds_before_close}s before close")
     cap_info_print = f" | Cap: {cap} bets max per streak" if cap is not None else " | Cap: None (uncapped)"
     print(f"Strategy: Lookback {history_beats_count} beats | Consecutive streak trigger: {consecutive_streak_count}{cap_info_print}")
+    pattern_desc = " -> ".join(f"{a}@{(stake_multipliers[i] if i < len(stake_multipliers) else 2.0 ** i):g}x" for i, a in enumerate(pattern[:max_cap]))
+    print(f"Campaign Pattern: {pattern_desc} | Sync corrections: {'ON' if sync_corrections else 'OFF'}")
 
     profit_target_str = f">= ${fade_profit_target_usd:.2f}" if fade_profit_target_usd is not None else "None"
     print(f"Trading Parameters: flat ${fade_stake_usd:.2f} base stake per trigger (Profit Target: {profit_target_str})")
@@ -1448,6 +1489,11 @@ async def run_live_bot(
             sessions_with_fills = set(sess.get("sessions_with_fills", []))
             fade_session_total_beats = sess.get("fade_session_total_beats", fade_session_total_beats)
             current_fade_stake_usd = sess.get("current_fade_stake_usd", current_fade_stake_usd)
+            if in_campaign and campaign_trigger_dir in ("Up", "Down"):
+                # Re-derive bet from the configured pattern (state may come from an older pattern)
+                campaign_action_type, fade_active_side, current_fade_stake_usd = get_campaign_bet(
+                    campaign_step, campaign_trigger_dir, pattern, stake_multipliers, base_stake_usd, max_cap
+                )
 
             # Load Pending lists
             pending_trades = {int(k): v for k, v in state_data.get("pending_trades", {}).items()}
@@ -1536,6 +1582,7 @@ async def run_live_bot(
                     "base_stake_usd": base_stake_usd,
                     "stake_multipliers": stake_multipliers,
                     "max_cap": max_cap,
+                    "pattern": pattern,
                 },
                 "session": {
                     "price_savings_bank": price_savings_bank,
@@ -1640,6 +1687,7 @@ async def run_live_bot(
             max_cap=max_cap,
             stake_multipliers=stake_multipliers,
             base_stake_usd=base_stake_usd,
+            pattern=pattern,
         )
 
         startup_last_streak = startup_outcomes[-consecutive_streak_count:]
@@ -1817,6 +1865,7 @@ async def run_live_bot(
     last_printed_token_id = None
     last_loop_beat_ts = None
     delayed_placement_beat_ts = None
+    delayed_wait_log_beat_ts = None
 
     async def place_beat_order(target_beat_start: int, target_side: str, target_stake: float):
         nonlocal active_order_id, active_order_token_id, active_order_side, active_order_stake
@@ -2033,13 +2082,19 @@ async def run_live_bot(
                             history_len=effective_history_len,
                             consecutive_streak_count=consecutive_streak_count,
                             cap=cap,
+                            max_cap=max_cap,
+                            stake_multipliers=stake_multipliers,
+                            base_stake_usd=base_stake_usd,
+                            pattern=pattern,
                         )
 
 
 
                         # False Trigger / Mismatch Check
                         true_in_fade = sim["in_fade_window"]
-                        is_history_complete = (len(resolved_outcomes_list) == effective_history_len)
+                        # Legacy history-based corrections are opt-in (sync_corrections). The campaign
+                        # state machine is driven by settled results of the bot's own trades/skips.
+                        is_history_complete = sync_corrections and (len(resolved_outcomes_list) == effective_history_len)
                         if is_history_complete and in_fade_window and not true_in_fade:
                             print(f"         [FALSE TRIGGER DETECTED] Bot is in fade window but history simulation says it should NOT be! Keeping order active and continuing trade...")
                             if notifications_enabled:
@@ -2375,7 +2430,7 @@ async def run_live_bot(
                                 # Special Martingale Campaign State Transition
                                 p_camp_step = p_trade.get("campaign_step", campaign_step)
                                 p_camp_dir = p_trade.get("campaign_trigger_dir", campaign_trigger_dir)
-                                p_camp_act = p_trade.get("action_type", "FOLLOW" if p_camp_step == 0 else "FADE")
+                                p_camp_act = p_trade.get("action_type") or get_campaign_bet(p_camp_step, p_camp_dir or "Up", pattern, stake_multipliers, base_stake_usd, max_cap)[0]
 
                                 campaign_pnl += pnl
                                 if won:
@@ -2388,15 +2443,20 @@ async def run_live_bot(
                                     campaign_pnl = 0.0
                                     in_fade_window = False
                                     fade_active_side = None
+                                    campaign_action_type = None
                                 else:
                                     p_camp_step += 1
-                                    if p_camp_step < max_cap:
+                                    if p_camp_step < max_cap and p_camp_dir in ("Up", "Down"):
                                         in_campaign = True
                                         campaign_step = p_camp_step
-                                        next_act = "FADE"
-                                        next_mult = stake_multipliers[campaign_step] if campaign_step < len(stake_multipliers) else (2.0 ** campaign_step)
-                                        next_stake = round(base_stake_usd * next_mult, 2)
-                                        camp_status_str = f"⚠️ Step {p_camp_step}/{max_cap} Lost ➡️ Advancing to Step {p_camp_step+1}/{max_cap} ({next_act}, ${next_stake:.2f})"
+                                        campaign_trigger_dir = p_camp_dir
+                                        next_act, next_side, next_stake = get_campaign_bet(
+                                            campaign_step, campaign_trigger_dir, pattern, stake_multipliers, base_stake_usd, max_cap
+                                        )
+                                        campaign_action_type = next_act
+                                        fade_active_side = next_side
+                                        current_fade_stake_usd = next_stake
+                                        camp_status_str = f"⚠️ Step {p_camp_step}/{max_cap} Lost ➡️ Advancing to Step {p_camp_step+1}/{max_cap} ({next_act} {next_side}, ${next_stake:.2f})"
                                         print(f"         [CAMPAIGN STEP ADVANCE] {camp_status_str}")
                                         in_fade_window = True
                                     else:
@@ -2409,6 +2469,7 @@ async def run_live_bot(
                                         campaign_pnl = 0.0
                                         in_fade_window = False
                                         fade_active_side = None
+                                        campaign_action_type = None
 
                                 fill_time_val = p_trade.get("fill_time")
                                 time_to_fill_str = "N/A"
@@ -2492,22 +2553,27 @@ async def run_live_bot(
                                 # Special Martingale Unfilled Handling:
                                 p_camp_step = p_skip.get("campaign_step", campaign_step)
                                 p_camp_dir = p_skip.get("campaign_trigger_dir", campaign_trigger_dir)
-                                p_camp_act = p_skip.get("action_type", "FOLLOW" if p_camp_step == 0 else "FADE")
+                                p_camp_act = p_skip.get("action_type") or get_campaign_bet(p_camp_step, p_camp_dir or "Up", pattern, stake_multipliers, base_stake_usd, max_cap)[0]
 
-                                if p_camp_step == 0 and trade_outcome != p_camp_dir:
+                                if p_camp_dir not in ("Up", "Down") or (p_camp_step == 0 and trade_outcome != p_camp_dir):
                                     # Streak reversed while unfilled on Step 0: cleanly reset to Step 0 with $0 loss!
                                     in_campaign = False
                                     campaign_step = 0
                                     campaign_trigger_dir = None
                                     in_fade_window = False
                                     fade_active_side = None
+                                    campaign_action_type = None
                                     skip_action_desc = "Streak broke while unfilled on Step 1. Cleanly reset to Step 1 ($0 loss)."
                                 else:
                                     # Streak continued or Step > 0: PRESERVE STEP!
                                     in_campaign = True
                                     campaign_step = p_camp_step
+                                    campaign_trigger_dir = p_camp_dir
+                                    campaign_action_type, fade_active_side, current_fade_stake_usd = get_campaign_bet(
+                                        campaign_step, campaign_trigger_dir, pattern, stake_multipliers, base_stake_usd, max_cap
+                                    )
                                     in_fade_window = True
-                                    skip_action_desc = f"Preserving Step {p_camp_step+1}/{max_cap} ({p_camp_act}) with stake ${current_fade_stake_usd:.2f} for next beat."
+                                    skip_action_desc = f"Preserving Step {p_camp_step+1}/{max_cap} ({campaign_action_type} {fade_active_side}) with stake ${current_fade_stake_usd:.2f} for next beat."
 
                                 print(f"         [SKIPPED EVALUATION] Unfilled session #{s_num} on {skip_side} beat outcome: {trade_outcome} -> Result: {skip_result_word} (UNFILLED - $0 risked)")
                                 print(f"         [SKIPPED ACTION] {skip_action_desc}")
@@ -2692,16 +2758,34 @@ async def run_live_bot(
                     print(f"         [WARNING] Periodic fill check failed: {fill_check_err}")
 
             # Delayed Maker Order Placement (when min_maker_sec > 0)
+            delayed_window_end = stop_maker_sec if stop_maker_sec is not None else (beat_duration_sec - seconds_before_close - 5)
+            prev_beat_ts_for_entry = current_beat_start - beat_duration_sec
+            prev_beat_unresolved = (prev_beat_ts_for_entry in pending_trades) or (prev_beat_ts_for_entry in pending_skipped_trades)
             if (min_maker_sec is not None and min_maker_sec > 0
                 and in_fade_window
                 and fade_active_side is not None
                 and active_order_id is None
                 and delayed_placement_beat_ts != current_beat_start
                 and elapsed_in_beat >= min_maker_sec
-                and elapsed_in_beat < (stop_maker_sec if stop_maker_sec is not None else (beat_duration_sec - seconds_before_close - 5))):
+                and prev_beat_unresolved):
+                # Campaign step depends on the previous beat's settled result: wait for the sync.
+                if elapsed_in_beat >= delayed_window_end:
+                    delayed_placement_beat_ts = current_beat_start
+                    print(f"         [DELAYED ENTRY SKIPPED] Previous beat {prev_beat_ts_for_entry} still unsettled at {elapsed_in_beat}s (>= {delayed_window_end}s). No order this beat.")
+                elif delayed_wait_log_beat_ts != current_beat_start:
+                    delayed_wait_log_beat_ts = current_beat_start
+                    print(f"         [DELAYED ENTRY WAIT] Waiting for previous beat {prev_beat_ts_for_entry} to settle before placing campaign order...")
+            elif (min_maker_sec is not None and min_maker_sec > 0
+                and in_fade_window
+                and fade_active_side is not None
+                and active_order_id is None
+                and delayed_placement_beat_ts != current_beat_start
+                and elapsed_in_beat >= min_maker_sec
+                and elapsed_in_beat < delayed_window_end):
 
                 delayed_placement_beat_ts = current_beat_start
-                print(f"         [DELAYED ENTRY] Beat elapsed: {elapsed_in_beat}s >= {min_maker_sec}s. Submitting delayed maker order for {fade_active_side} (${current_fade_stake_usd:.2f})...")
+                step_lbl = f"Step {campaign_step+1}/{max_cap} {campaign_action_type} " if in_campaign else ""
+                print(f"         [DELAYED ENTRY] Beat elapsed: {elapsed_in_beat}s >= {min_maker_sec}s. Submitting delayed maker order {step_lbl}for {fade_active_side} (${current_fade_stake_usd:.2f})...")
                 await place_beat_order(current_beat_start, fade_active_side, current_fade_stake_usd)
 
             # Post-only cancellation & taker order placement check
@@ -3319,6 +3403,7 @@ async def run_live_bot(
                     max_cap=max_cap,
                     stake_multipliers=stake_multipliers,
                     base_stake_usd=base_stake_usd,
+                    pattern=pattern,
                 )
 
                 last_n_outcomes = recent_outcomes[-consecutive_streak_count:]
@@ -3378,7 +3463,7 @@ async def run_live_bot(
                         if in_campaign:
                             vol_failed = False
                             delta_failed = False
-                            print(f"         [SPECIAL MARTINGALE CAMPAIGN] Step {campaign_step+1}/{max_cap} active ({streak_action_type}). Filter bypassed for recovery.")
+                            print(f"         [SPECIAL MARTINGALE CAMPAIGN] Step {campaign_step+1}/{max_cap} active ({streak_action_type}). Filter bypassed for recovery. (Provisional: next step/side is finalized once this beat settles.)")
                         elif dyn_filter_enabled and dynamic_rules:
                             _, curr_vol_pct, vol_msg = check_volatility_filter(
                                 asset=asset, enabled=True, threshold_pct=dyn_min_vol_pct, lookback_candles=vol_lookback_candles, source=dyn_vol_source
@@ -3784,6 +3869,18 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated stake multipliers for progression (default: '1,2,4')",
     )
     parser.add_argument(
+        "--pattern",
+        type=str,
+        default=None,
+        help="Comma-separated campaign pattern of FADE/FOLLOW per step (default: 'FADE,FOLLOW,FADE')",
+    )
+    parser.add_argument(
+        "--sync-corrections",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable legacy history-based sync corrections (FALSE TRIGGER / SIDE MISMATCH / MISSING TRIGGER). Default: off",
+    )
+    parser.add_argument(
         "--max-cap",
         type=nullable_int,
         default=None,
@@ -4155,6 +4252,13 @@ if __name__ == "__main__":
         stake_multipliers = [float(x) for x in stake_mult_cfg]
     else:
         stake_multipliers = [1.0, 2.0, 4.0]
+    pattern_cfg = args.pattern if getattr(args, "pattern", None) is not None else config_data.get("pattern")
+    campaign_pattern = normalize_pattern(pattern_cfg)
+    sync_corrections = (
+        args.sync_corrections
+        if getattr(args, "sync_corrections", None) is not None
+        else bool(config_data.get("sync_corrections", False))
+    )
     fade_profit_target_usd = args.fade_profit_target_usd if args.fade_profit_target_usd is not None else config_data.get("fade_profit_target_usd")
     notifications_enabled = args.notifications if args.notifications is not None else config_data.get("notifications", True)
     asset_val = args.asset if args.asset is not None else config_data.get("asset", "BTC")
@@ -4341,6 +4445,8 @@ if __name__ == "__main__":
             volatility_filter_config=volatility_filter_config,
             take_profit_config=take_profit_config,
             delta_filter_config=delta_filter_config,
+            pattern=campaign_pattern,
+            sync_corrections=sync_corrections,
             dynamic_filter_config=dynamic_filter_config,
         ))
     except KeyboardInterrupt:
