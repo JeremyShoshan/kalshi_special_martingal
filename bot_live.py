@@ -1244,6 +1244,14 @@ async def run_live_bot(
         delta_threshold = float(delta_filter_config["delta_threshold"]) if delta_filter_config.get("delta_threshold") is not None else None
         delta_source = str(delta_filter_config.get("source", "binance"))
 
+    # Range is only shown when a range condition is actually configured (body-only filter otherwise)
+    range_filter_active = delta_max_range is not None or delta_ceiling_range is not None
+
+    def fmt_delta_msg(msg: str) -> str:
+        if range_filter_active:
+            return msg
+        return re.sub(r"High: \$[\d,\.]+ \| Low: \$[\d,\.]+ -> Range: \$[\d,\.]+ \| ", "", msg)
+
     tp_enabled = False
     tp_target_pct = 0.14
     if isinstance(take_profit_config, dict) and take_profit_config.get("enabled", False):
@@ -1757,7 +1765,7 @@ async def run_live_bot(
                     d_valid, d_rng, d_body, b_hi, b_lo, d_msg = fetch_binance_15m_delta_range(
                         asset=asset, beat_start_ts=last_closed_beat_ts
                     )
-                    print(f"         [STARTUP DELTA FILTER] {d_msg}")
+                    print(f"         [STARTUP DELTA FILTER] {fmt_delta_msg(d_msg)}")
                     if not d_valid:
                         skip_startup_by_delta = True
                         print(f"         [STARTUP DELTA FILTER: SKIP] Binance Network Issue ({d_msg}). Skipping startup trade.")
@@ -2244,7 +2252,7 @@ async def run_live_bot(
                                 d_valid, d_rng, d_body, b_hi, b_lo, d_msg = fetch_binance_15m_delta_range(
                                     asset=asset, beat_start_ts=last_closed_beat_ts
                                 )
-                                print(f"         [SYNC DELTA FILTER] {d_msg}")
+                                print(f"         [SYNC DELTA FILTER] {fmt_delta_msg(d_msg)}")
                                 if not d_valid:
                                     skip_sync_by_delta = True
                                     print(f"         [DELTA FILTER: SKIP] Sync trigger suppressed due to Binance Network Issue ({d_msg}).")
@@ -2614,7 +2622,8 @@ async def run_live_bot(
                                 fs_total = bot.state.filter_skipped_count
                                 fs_wr = (100.0 * bot.state.filter_skipped_wins / fs_total) if fs_total > 0 else 0.0
 
-                                print(f"         [FILTER_SKIP EVALUATION] Filter_Skip #{fs_num} on {fs_side} (15m Range: ${fs_delta_range:.2f} | Body: ${fs_delta_body:.2f}) resolved: {trade_outcome} -> Result: {fs_result_word} (FILTER_SKIP)")
+                                fs_cond_str = f"15m Range: ${fs_delta_range:.2f} | Body: ${fs_delta_body:.2f}" if range_filter_active else f"15m Body: ${fs_delta_body:.2f}"
+                                print(f"         [FILTER_SKIP EVALUATION] Filter_Skip #{fs_num} on {fs_side} ({fs_cond_str}) resolved: {trade_outcome} -> Result: {fs_result_word} (FILTER_SKIP)")
                                 print(f"         [FILTER_SKIP STATS] Total Filter_Skips: {bot.state.filter_skipped_count} | Wins: {bot.state.filter_skipped_wins} | Losses: {bot.state.filter_skipped_losses} (WR: {fs_wr:.1f}%)")
 
                                 if notifications_enabled:
@@ -2623,7 +2632,7 @@ async def run_live_bot(
                                     fs_vol = p_fs.get('vol_pct')
                                     fs_body = p_fs.get('delta_body')
                                     c_parts = []
-                                    if fs_delta_range > 0:
+                                    if fs_delta_range > 0 and range_filter_active:
                                         c_parts.append(f"R: ${fs_delta_range:.1f}")
                                     if fs_body is not None:
                                         c_parts.append(f"B: ${fs_body:.1f}")
@@ -3612,7 +3621,7 @@ async def run_live_bot(
                                     delta_valid, delta_rng, delta_body, b_high, b_low, delta_msg = fetch_binance_15m_delta_range(
                                         asset=asset, beat_start_ts=current_beat_start
                                     )
-                                    print(f"         [DELTA FILTER] {delta_msg}")
+                                    print(f"         [DELTA FILTER] {fmt_delta_msg(delta_msg)}")
                                     if not delta_valid:
                                         print(f"         [DELTA FILTER ERROR] Binance not available ({delta_msg}). Skipping bet due to Binance Network Issue.")
                                         if notifications_enabled:
@@ -3657,7 +3666,7 @@ async def run_live_bot(
                                         if delta_max_range is not None:
                                             pass_parts.append(f"R: ${delta_rng:.2f} (Req >= ${delta_max_range:.2f})")
                                             pass_filter_parts.append(f"📈 R: ${delta_rng:.2f} (Req >= ${delta_max_range:.2f})\n")
-                                        else:
+                                        elif range_filter_active:
                                             pass_parts.append(f"R: ${delta_rng:.2f}")
                                         if delta_threshold is not None:
                                             pass_parts.append(f"B: ${delta_body:.2f} (Req >= ${delta_threshold:.2f})")
